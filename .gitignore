@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.pyo
+.env
+venv/
+.venv/
+output/
+*.dxf
+*.dwg
+*.dae
+*.skp
+*.stl
+*.obj
+*.glb
+.DS_Store
