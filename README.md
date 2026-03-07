@@ -124,3 +124,15 @@ PRs welcome. See open issues for roadmap items:
 ## License
 
 MIT
+
+## Samples
+
+| File | Description |
+|---|---|
+| [sample_floor_plan.dxf](samples/sample_floor_plan.dxf) | Sample 2BHK apartment floor plan — ready to open in AutoCAD or FreeCAD |
+| [before_after.png](samples/before_after.png) | Before/after comparison — 3D SketchUp model vs clean 2D CAD output |
+| [pitch_deck.pdf](samples/pitch_deck.pdf) | Client pitch deck with pricing and workflow overview |
+
+### Before / After
+
+![Before/After](samples/before_after.png)
