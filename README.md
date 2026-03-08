@@ -136,3 +136,9 @@ MIT
 ### Before / After
 
 ![Before/After](samples/before_after.png)
+
+## Research
+
+| Topic | File |
+|---|---|
+| Solana Trading Strategies | [research/solana-trading-strategies.md](research/solana-trading-strategies.md) |
