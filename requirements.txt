@@ -3,3 +3,5 @@ ezdxf>=1.1.0
 trimesh>=4.0.0
 lxml>=4.9.0
 scipy>=1.11.0
+reportlab>=4.0.0
+matplotlib>=3.7.0
