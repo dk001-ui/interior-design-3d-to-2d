@@ -1,0 +1,60 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "interior-design-3d-to-2d"
+version = "0.1.0"
+description = "Convert SketchUp / COLLADA 3D models to clean 2D CAD drawings (DXF)"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.9"
+authors = [{ name = "dk001-ui" }]
+keywords = ["architecture", "interior-design", "CAD", "DXF", "SketchUp", "COLLADA"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: End Users/Desktop",
+    "Topic :: Scientific/Engineering :: Visualization",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+    "numpy>=1.24.0",
+    "ezdxf>=1.1.0",
+    "trimesh>=4.0.0",
+    "lxml>=4.9.0",
+    "scipy>=1.11.0",
+    "reportlab>=4.0.0",
+    "matplotlib>=3.7.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+    "pytest-cov>=4.1",
+]
+
+[project.scripts]
+id32d = "extract:main"
+
+[project.urls]
+Homepage = "https://github.com/dk001-ui/interior-design-3d-to-2d"
+Repository = "https://github.com/dk001-ui/interior-design-3d-to-2d"
+Issues = "https://github.com/dk001-ui/interior-design-3d-to-2d/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["parser*", "core*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --tb=short"
+
+[tool.coverage.run]
+source = ["core", "parser"]
+omit = ["tests/*", "scripts/*"]
