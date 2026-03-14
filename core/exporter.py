@@ -1,28 +1,38 @@
 """
-core/exporter.py — Export SliceResult objects to DXF/DWG files.
+core/exporter.py -- Export SliceResult objects to DXF files.
 
-Uses ezdxf (pure Python, no AutoCAD needed).
-DXF files open directly in AutoCAD, FreeCAD, LibreCAD, BricsCAD.
+Now supports:
+  - Per-layer DXF export (one DXF per CAD layer, or all layers in one file)
+  - MEP, Electrical, Furniture, Structural layer colors
+  - Layer visibility control (export only specified layers)
+  - Combined multi-layer DXF for full drawing sets
 
-Usage:
-    from core.exporter import Exporter
-    from core.slicer import Slicer
-
-    exporter = Exporter(config, output_dir="output/")
-    exporter.export_floor_plan(slicer.floor_plan())
-    exporter.export_elevations(slicer.elevations())
-    exporter.export_sections(slicer.sections())
+Layer color scheme (AutoCAD Color Index):
+    WALLS        ->  7   white/black
+    FLOOR        ->  8   grey
+    CEILING      ->  9   light grey
+    DOORS        ->  30  orange
+    WINDOWS      ->  140 light blue
+    STAIRS       ->  50  brown
+    FURNITURE    ->  2   yellow
+    MEP          ->  5   blue
+    ELECTRICAL   ->  1   red
+    STRUCTURE    ->  6   magenta
+    SITE         ->  3   green
+    ANNOTATIONS  ->  8   grey
+    DIMENSIONS   ->  7   white
+    TITLE_BLOCK  ->  7   white
+    MISC         ->  9   light grey
 """
 
 import os
 import logging
-from typing import Dict, List
+from typing import Dict, List, Optional
 from pathlib import Path
 
 try:
     import ezdxf
     from ezdxf import units
-    from ezdxf.enums import TextEntityAlignment
 except ImportError:
     raise ImportError("ezdxf not installed. Run: pip install ezdxf")
 
@@ -30,19 +40,50 @@ from core.slicer import SliceResult, Segment
 
 logger = logging.getLogger(__name__)
 
-# Layer color map (AutoCAD color index)
+# Full layer color map (AutoCAD Color Index)
 LAYER_COLORS = {
-    "FLOOR_PLAN":        2,   # yellow
-    "ELEVATION_NORTH":   3,   # green
-    "ELEVATION_SOUTH":   3,
-    "ELEVATION_EAST":    4,   # cyan
-    "ELEVATION_WEST":    4,
-    "SECTION_1":         1,   # red
-    "SECTION_2":         6,   # magenta
-    "SECTION_3":         5,   # blue
-    "DIMENSIONS":        7,   # white
-    "ANNOTATIONS":       8,   # grey
-    "TITLE_BLOCK":       7,
+    "WALLS":        7,    # white/black
+    "FLOOR":        8,    # grey
+    "CEILING":      9,    # light grey
+    "DOORS":        30,   # orange
+    "WINDOWS":      140,  # light blue
+    "STAIRS":       50,   # brown
+    "FURNITURE":    2,    # yellow
+    "MEP":          5,    # blue
+    "ELECTRICAL":   1,    # red
+    "STRUCTURE":    6,    # magenta
+    "SITE":         3,    # green
+    "ANNOTATIONS":  8,    # grey
+    "DIMENSIONS":   7,    # white
+    "TITLE_BLOCK":  7,    # white
+    "MISC":         9,    # light grey
+    # elevation/section layers
+    "FLOOR_PLAN":         2,
+    "ELEVATION_NORTH":    3,
+    "ELEVATION_SOUTH":    3,
+    "ELEVATION_EAST":     4,
+    "ELEVATION_WEST":     4,
+}
+
+# Linetype per layer (for MEP/Electrical dashed lines)
+LAYER_LINETYPES = {
+    "MEP":         "DASHED",
+    "ELECTRICAL":  "DASHED2",
+    "ANNOTATIONS": "DOTTED",
+}
+
+# Lineweight per layer (mm * 100)
+LAYER_LINEWEIGHTS = {
+    "WALLS":      50,   # 0.50mm -- heavy
+    "STRUCTURE":  70,   # 0.70mm -- heaviest
+    "FLOOR":      25,   # 0.25mm
+    "CEILING":    18,   # 0.18mm
+    "FURNITURE":  18,   # 0.18mm
+    "MEP":        18,   # 0.18mm
+    "ELECTRICAL": 13,   # 0.13mm
+    "DOORS":      35,   # 0.35mm
+    "WINDOWS":    25,   # 0.25mm
+    "DIMENSIONS": 13,   # 0.13mm
 }
 
 
@@ -51,21 +92,23 @@ class Exporter:
         self.config = config
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.scale = config.get("scale", 50)          # 1:50 default
-        self.project_name = config.get("project_name", "Project")
-        self.drawn_by = config.get("drawn_by", "")
-        self.add_dimensions = config.get("add_dimensions", True)
+        self.scale           = config.get("scale", 50)
+        self.project_name    = config.get("project_name", "Project")
+        self.drawn_by        = config.get("drawn_by", "")
+        self.add_dimensions  = config.get("add_dimensions", True)
         self.add_title_block = config.get("add_title_block", True)
+        # Layer filter: if set, only export these layers
+        self.active_layers: Optional[List[str]] = config.get("layers", None)
 
-    # ------------------------------------------------------------------ #
+    # ----------------------------------------------------------------------- #
     #  PUBLIC
-    # ------------------------------------------------------------------ #
+    # ----------------------------------------------------------------------- #
 
     def export_floor_plan(self, result: SliceResult) -> str:
-        path = self.output_dir / f"floor_plan.dxf"
+        path = self.output_dir / "floor_plan.dxf"
         doc = self._new_doc()
         msp = doc.modelspace()
-        self._add_layer(doc, result.layer, LAYER_COLORS.get(result.layer, 7))
+        self._setup_layers(doc)
         self._draw_segments(msp, result.segments, result.layer)
         if self.add_dimensions:
             self._add_dimensions(msp, result)
@@ -81,9 +124,8 @@ class Exporter:
             path = self.output_dir / f"{name}.dxf"
             doc = self._new_doc()
             msp = doc.modelspace()
-            layer_key = name.upper()
-            self._add_layer(doc, layer_key, LAYER_COLORS.get(layer_key, 3))
-            self._draw_segments(msp, result.segments, layer_key)
+            self._setup_layers(doc)
+            self._draw_segments(msp, result.segments, name.upper())
             if self.add_dimensions:
                 self._add_dimensions(msp, result)
             if self.add_title_block:
@@ -100,10 +142,8 @@ class Exporter:
             path = self.output_dir / f"{name}.dxf"
             doc = self._new_doc()
             msp = doc.modelspace()
-            idx = list(sections.keys()).index(name) + 1
-            layer_key = f"SECTION_{idx}"
-            self._add_layer(doc, layer_key, LAYER_COLORS.get(layer_key, 1))
-            self._draw_segments(msp, result.segments, layer_key)
+            self._setup_layers(doc)
+            self._draw_segments(msp, result.segments, result.layer)
             if self.add_dimensions:
                 self._add_dimensions(msp, result)
             if self.add_title_block:
@@ -114,92 +154,159 @@ class Exporter:
             paths.append(str(path))
         return paths
 
-    def export_all(self, floor_plan: SliceResult,
-                   elevations: Dict[str, SliceResult],
-                   sections: Dict[str, SliceResult]) -> Dict:
-        return {
-            "floor_plan": self.export_floor_plan(floor_plan),
-            "elevations": self.export_elevations(elevations),
-            "sections":   self.export_sections(sections),
-        }
+    def export_by_layer(self, results: Dict[str, SliceResult]) -> List[str]:
+        """
+        Export one DXF file per CAD layer.
+        Results dict maps layer_name -> SliceResult.
+        Respects active_layers filter from config.
+        """
+        paths = []
+        for layer_name, result in results.items():
+            if self.active_layers and layer_name not in self.active_layers:
+                logger.info(f"Skipping layer {layer_name} (not in active_layers filter)")
+                continue
+            filename = f"layer_{layer_name.lower()}.dxf"
+            path = self.output_dir / filename
+            doc = self._new_doc()
+            msp = doc.modelspace()
+            self._setup_layers(doc)
+            self._draw_segments(msp, result.segments, layer_name)
+            if self.add_title_block:
+                label = f"{layer_name} - Scale 1:{self.scale}"
+                self._add_title_block(msp, result, label)
+            doc.saveas(str(path))
+            logger.info(f"Saved layer DXF: {path}")
+            paths.append(str(path))
+        return paths
 
-    # ------------------------------------------------------------------ #
-    #  INTERNAL
-    # ------------------------------------------------------------------ #
+    def export_combined(self, results: Dict[str, SliceResult], filename: str = "combined.dxf") -> str:
+        """
+        Export all layers into a single DXF file.
+        Each CAD layer (WALLS, MEP, ELECTRICAL, etc.) is a separate DXF layer.
+        Respects active_layers filter from config.
+        """
+        path = self.output_dir / filename
+        doc = self._new_doc()
+        msp = doc.modelspace()
+        self._setup_layers(doc)
+
+        drawn = 0
+        for layer_name, result in results.items():
+            if self.active_layers and layer_name not in self.active_layers:
+                continue
+            self._draw_segments(msp, result.segments, layer_name)
+            drawn += len(result.segments)
+
+        logger.info(f"Combined DXF: {drawn} segments across {len(results)} layers -> {path}")
+        doc.saveas(str(path))
+        return str(path)
+
+    # ----------------------------------------------------------------------- #
+    #  PRIVATE: DXF SETUP
+    # ----------------------------------------------------------------------- #
 
     def _new_doc(self):
         doc = ezdxf.new("R2010")
         doc.units = units.M
-        self._add_layer(doc, "DIMENSIONS", LAYER_COLORS["DIMENSIONS"])
-        self._add_layer(doc, "ANNOTATIONS", LAYER_COLORS["ANNOTATIONS"])
-        self._add_layer(doc, "TITLE_BLOCK", LAYER_COLORS["TITLE_BLOCK"])
         return doc
 
-    def _add_layer(self, doc, name: str, color: int):
-        if name not in doc.layers:
-            doc.layers.add(name, color=color)
+    def _setup_layers(self, doc):
+        """Register all known CAD layers with correct colors, linetypes, lineweights."""
+        # Load standard linetypes
+        try:
+            doc.linetypes.load_ltypes_into_table(
+                "DASHED", force=False
+            )
+        except Exception:
+            pass  # linetypes may already be loaded
+
+        for layer_name, color in LAYER_COLORS.items():
+            if layer_name not in doc.layers:
+                attribs = {"color": color}
+                ltype = LAYER_LINETYPES.get(layer_name)
+                lw = LAYER_LINEWEIGHTS.get(layer_name)
+                if ltype:
+                    try:
+                        attribs["linetype"] = ltype
+                    except Exception:
+                        pass
+                if lw:
+                    attribs["lineweight"] = lw
+                doc.layers.add(layer_name, dxfattribs=attribs)
 
     def _draw_segments(self, msp, segments: List[Segment], layer: str):
-        for (x1, y1), (x2, y2) in segments:
-            msp.add_line((x1, y1), (x2, y2), dxfattribs={"layer": layer})
+        # Ensure layer exists
+        if layer not in msp.doc.layers:
+            msp.doc.layers.add(layer, dxfattribs={"color": LAYER_COLORS.get(layer, 7)})
+        for seg in segments:
+            (x1, y1), (x2, y2) = seg
+            msp.add_line(
+                start=(x1, y1),
+                end=(x2, y2),
+                dxfattribs={"layer": layer}
+            )
 
     def _add_dimensions(self, msp, result: SliceResult):
-        """Add overall width and height dimensions."""
-        if not result.segments:
+        (min_x, min_y), (max_x, max_y) = result.bounds()
+        w = max_x - min_x
+        h = max_y - min_y
+        if w < 0.01 or h < 0.01:
             return
-        (minx, miny), (maxx, maxy) = result.bounds()
-        w = maxx - minx
-        h = maxy - miny
-        offset = max(w, h) * 0.05 + 0.5
 
-        # Width dimension (bottom)
+        offset = 0.5
         msp.add_linear_dim(
-            base=(minx, miny - offset),
-            p1=(minx, miny - offset),
-            p2=(maxx, miny - offset),
-            angle=0,
+            base=(min_x, min_y - offset),
+            p1=(min_x, min_y - offset),
+            p2=(max_x, min_y - offset),
+            dimstyle="EZDXF",
+            override={"dimtxt": 0.15, "dimasz": 0.1},
             dxfattribs={"layer": "DIMENSIONS"}
         ).render()
 
-        # Height dimension (right)
         msp.add_linear_dim(
-            base=(maxx + offset, miny),
-            p1=(maxx + offset, miny),
-            p2=(maxx + offset, maxy),
+            base=(min_x - offset, min_y),
+            p1=(min_x - offset, min_y),
+            p2=(min_x - offset, max_y),
             angle=90,
+            dimstyle="EZDXF",
+            override={"dimtxt": 0.15, "dimasz": 0.1},
             dxfattribs={"layer": "DIMENSIONS"}
         ).render()
 
     def _add_title_block(self, msp, result: SliceResult, label: str):
-        """Simple title block at bottom of drawing."""
-        if not result.segments:
+        (min_x, min_y), (max_x, max_y) = result.bounds()
+        if max_x == min_x:
             return
-        (minx, miny), (maxx, maxy) = result.bounds()
-        tb_y = miny - 2.0
-        tb_x = minx
 
-        # Border
+        tb_y = min_y - 1.5
+        tb_h = 0.8
+        tb_w = max_x - min_x
+
         msp.add_lwpolyline(
-            [(tb_x, tb_y), (maxx, tb_y), (maxx, tb_y - 1.0), (tb_x, tb_y - 1.0)],
-            close=True,
+            [(min_x, tb_y), (max_x, tb_y), (max_x, tb_y - tb_h),
+             (min_x, tb_y - tb_h), (min_x, tb_y)],
             dxfattribs={"layer": "TITLE_BLOCK"}
         )
-
-        # Project name
         msp.add_text(
             self.project_name,
-            dxfattribs={"layer": "TITLE_BLOCK", "height": 0.25}
-        ).set_placement((tb_x + 0.1, tb_y - 0.3), align=TextEntityAlignment.LEFT)
-
-        # Drawing label
+            dxfattribs={"layer": "TITLE_BLOCK", "height": 0.25,
+                        "insert": (min_x + 0.1, tb_y - 0.3)}
+        )
         msp.add_text(
             label,
-            dxfattribs={"layer": "TITLE_BLOCK", "height": 0.18}
-        ).set_placement((tb_x + 0.1, tb_y - 0.6), align=TextEntityAlignment.LEFT)
-
-        # Drawn by
+            dxfattribs={"layer": "TITLE_BLOCK", "height": 0.18,
+                        "insert": (min_x + 0.1, tb_y - 0.55)}
+        )
         if self.drawn_by:
             msp.add_text(
                 f"Drawn by: {self.drawn_by}",
-                dxfattribs={"layer": "TITLE_BLOCK", "height": 0.15}
-            ).set_placement((tb_x + 0.1, tb_y - 0.85), align=TextEntityAlignment.LEFT)
+                dxfattribs={"layer": "TITLE_BLOCK", "height": 0.15,
+                            "insert": (max_x - tb_w * 0.35, tb_y - 0.3)}
+            )
+        date_str = self.config.get("date", "")
+        if date_str:
+            msp.add_text(
+                f"Date: {date_str}",
+                dxfattribs={"layer": "TITLE_BLOCK", "height": 0.15,
+                            "insert": (max_x - tb_w * 0.35, tb_y - 0.55)}
+            )
