@@ -1,19 +1,32 @@
 """
-parser/collada.py — Parse COLLADA (.dae) files exported from SketchUp.
+parser/collada.py -- Parse COLLADA (.dae) files exported from SketchUp.
 
-COLLADA is an open XML format that SketchUp can export natively:
-  File > Export > 3D Model > COLLADA (.dae)
+Now with full layer-aware parsing. SketchUp exports layer names into COLLADA
+node attributes. This parser extracts them and maps to standard CAD layers:
+
+    SketchUp Layer Name        ->  CAD Layer
+    ------------------------------------------
+    Layer0 / default / 0       ->  WALLS
+    Walls / Wall                ->  WALLS
+    Furniture / FF&E            ->  FURNITURE
+    MEP / Services / Plumbing   ->  MEP
+    Electrical / Lighting       ->  ELECTRICAL
+    Ceiling / Roof              ->  CEILING
+    Floor / Slab                ->  FLOOR
+    Annotation / Text           ->  ANNOTATIONS
+    (anything else)             ->  MISC
 
 Usage:
     from parser.collada import ColladaParser
     model = ColladaParser("model.dae").parse()
     # model.meshes -> list of Mesh(vertices, faces, name, layer)
+    # model.layers -> set of layer names present in model
 """
 
 import xml.etree.ElementTree as ET
 import numpy as np
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List, Optional, Set
 import logging
 
 logger = logging.getLogger(__name__)
@@ -22,19 +35,68 @@ NS = {
     "c": "http://www.collada.org/2005/11/COLLADASchema"
 }
 
+# ---------------------------------------------------------------------------
+# Layer name normalisation map
+# Keys are lowercase substrings to match against the raw SketchUp layer name
+# ---------------------------------------------------------------------------
+LAYER_MAP = [
+    (["wall"],                          "WALLS"),
+    (["floor", "slab", "ground"],       "FLOOR"),
+    (["ceiling", "roof", "soffit"],     "CEILING"),
+    (["door"],                          "DOORS"),
+    (["window", "glazing", "glass"],    "WINDOWS"),
+    (["stair", "step", "ramp"],         "STAIRS"),
+    (["furniture", "ffe", "ff&e",
+      "cabinet", "wardrobe", "joinery",
+      "kitchen", "bed", "sofa"],        "FURNITURE"),
+    (["mep", "service", "plumbing",
+      "hvac", "duct", "pipe",
+      "sanitary", "water"],             "MEP"),
+    (["electric", "lighting", "light",
+      "power", "socket", "switch"],     "ELECTRICAL"),
+    (["column", "beam", "struct",
+      "slab", "concrete"],              "STRUCTURE"),
+    (["site", "boundary", "plot",
+      "landscape", "garden"],           "SITE"),
+    (["annot", "text", "label",
+      "dimension", "grid"],             "ANNOTATIONS"),
+]
+
+DEFAULT_LAYER = "WALLS"   # Layer0 / unnamed geometry -> walls
+
+
+def normalise_layer(raw: str) -> str:
+    """Map a raw SketchUp layer name to a standard CAD layer."""
+    if not raw:
+        return DEFAULT_LAYER
+    lower = raw.lower().replace(" ", "").replace("_", "").replace("-", "")
+    # Layer0 / default / "0" -> WALLS (SketchUp default layer)
+    if lower in ("0", "layer0", "default", "defaultlayer", ""):
+        return DEFAULT_LAYER
+    for keywords, cad_layer in LAYER_MAP:
+        for kw in keywords:
+            if kw in lower:
+                return cad_layer
+    return "MISC"
+
 
 @dataclass
 class Mesh:
     name: str
-    layer: str
-    vertices: np.ndarray   # shape (N, 3) float64 — XYZ in metres
-    faces: np.ndarray      # shape (M, 3) int    — triangle indices
+    layer: str           # normalised CAD layer name e.g. "WALLS"
+    layer_raw: str       # original SketchUp layer string
+    vertices: np.ndarray  # shape (N, 3) float64 -- XYZ in metres
+    faces: np.ndarray    # shape (M, 3) int    -- triangle indices
 
 
 @dataclass
 class Model:
     meshes: List[Mesh] = field(default_factory=list)
     source_file: str = ""
+
+    @property
+    def layers(self) -> Set[str]:
+        return {m.layer for m in self.meshes}
 
     @property
     def all_vertices(self) -> np.ndarray:
@@ -46,6 +108,13 @@ class Model:
     def bounds(self):
         verts = self.all_vertices
         return verts.min(axis=0), verts.max(axis=0)
+
+    def meshes_for_layer(self, layer: str) -> List[Mesh]:
+        return [m for m in self.meshes if m.layer == layer]
+
+    def meshes_for_layers(self, layers: List[str]) -> List[Mesh]:
+        layer_set = set(layers)
+        return [m for m in self.meshes if m.layer in layer_set]
 
 
 class ColladaParser:
@@ -59,19 +128,27 @@ class ColladaParser:
         geometries = self._parse_geometries()
         nodes = self._parse_nodes()
 
-        for node_name, geo_id, layer, transform in nodes:
+        for node_name, geo_id, layer_raw, transform in nodes:
             if geo_id in geometries:
                 verts, faces = geometries[geo_id]
-                # Apply transform matrix
                 transformed = self._apply_transform(verts, transform)
+                layer = normalise_layer(layer_raw)
                 model.meshes.append(Mesh(
                     name=node_name,
                     layer=layer,
+                    layer_raw=layer_raw,
                     vertices=transformed,
                     faces=faces
                 ))
 
+        # Log layer summary
+        layer_counts = {}
+        for m in model.meshes:
+            layer_counts[m.layer] = layer_counts.get(m.layer, 0) + 1
         logger.info(f"Parsed {len(model.meshes)} meshes from {self.filepath}")
+        for layer, count in sorted(layer_counts.items()):
+            logger.info(f"  {layer}: {count} mesh(es)")
+
         return model
 
     def _parse_geometries(self):
@@ -89,84 +166,123 @@ class ColladaParser:
         return geometries
 
     def _extract_mesh(self, mesh_el):
-        # Find position source
         pos_source = None
         for source in mesh_el.findall("c:source", NS):
             src_id = source.get("id", "")
             if "position" in src_id or "vertex" in src_id:
                 float_arr = source.find(".//c:float_array", NS)
                 if float_arr is not None:
-                    values = list(map(float, float_arr.text.split()))
-                    pos_source = np.array(values).reshape(-1, 3)
+                    pos_source = float_arr
                     break
 
         if pos_source is None:
-            # fallback: first float array
-            float_arr = mesh_el.find(".//c:float_array", NS)
-            values = list(map(float, float_arr.text.split()))
-            pos_source = np.array(values).reshape(-1, 3)
+            raise ValueError("No position source found in mesh")
 
-        # Find triangles or polygons
+        raw = list(map(float, pos_source.text.strip().split()))
+        vertices = np.array(raw, dtype=np.float64).reshape(-1, 3)
+
+        # SketchUp exports in inches -- convert to metres
+        if vertices.max() > 50:
+            vertices = vertices * 0.0254
+
+        triangles_el = mesh_el.find("c:triangles", NS)
+        polylist_el  = mesh_el.find("c:polylist", NS)
+
+        faces = None
+        if triangles_el is not None:
+            faces = self._parse_triangles(triangles_el)
+        elif polylist_el is not None:
+            faces = self._parse_polylist(polylist_el)
+        else:
+            for tag in ["c:polygons", "c:lines"]:
+                el = mesh_el.find(tag, NS)
+                if el is not None:
+                    faces = self._parse_triangles(el)
+                    break
+
+        if faces is None:
+            raise ValueError("No triangle/polygon primitive found")
+
+        return vertices, faces
+
+    def _parse_triangles(self, el):
+        p_el = el.find("c:p", NS)
+        if p_el is None or not p_el.text:
+            return np.empty((0, 3), dtype=np.int32)
+        indices = list(map(int, p_el.text.strip().split()))
+        inputs = el.findall("c:input", NS)
+        stride = len(inputs) if inputs else 1
+        vertex_offset = 0
+        for inp in inputs:
+            if inp.get("semantic") == "VERTEX":
+                vertex_offset = int(inp.get("offset", 0))
+                break
+        vertex_indices = indices[vertex_offset::stride]
+        n_triangles = len(vertex_indices) // 3
+        return np.array(vertex_indices[:n_triangles * 3], dtype=np.int32).reshape(-1, 3)
+
+    def _parse_polylist(self, el):
+        vcount_el = el.find("c:vcount", NS)
+        p_el      = el.find("c:p", NS)
+        if p_el is None or not p_el.text:
+            return np.empty((0, 3), dtype=np.int32)
+
+        inputs = el.findall("c:input", NS)
+        stride = len(inputs) if inputs else 1
+        vertex_offset = 0
+        for inp in inputs:
+            if inp.get("semantic") == "VERTEX":
+                vertex_offset = int(inp.get("offset", 0))
+                break
+
+        raw_indices = list(map(int, p_el.text.strip().split()))
+        vcounts = list(map(int, vcount_el.text.strip().split())) if vcount_el is not None else []
+
         faces = []
-        for prim in mesh_el.findall("c:triangles", NS):
-            p_el = prim.find("c:p", NS)
-            if p_el is not None:
-                indices = list(map(int, p_el.text.split()))
-                # stride = number of inputs
-                inputs = prim.findall("c:input", NS)
-                stride = len(inputs)
-                vert_offset = 0
-                for inp in inputs:
-                    if inp.get("semantic") == "VERTEX":
-                        vert_offset = int(inp.get("offset", 0))
-                tri_indices = [indices[i] for i in range(vert_offset, len(indices), stride)]
-                faces = np.array(tri_indices).reshape(-1, 3)
+        idx = 0
+        for vc in vcounts:
+            poly_verts = []
+            for _ in range(vc):
+                poly_verts.append(raw_indices[idx + vertex_offset])
+                idx += stride
+            for i in range(1, len(poly_verts) - 1):
+                faces.append([poly_verts[0], poly_verts[i], poly_verts[i + 1]])
 
-        if len(faces) == 0:
-            # polylist fallback
-            for prim in mesh_el.findall("c:polylist", NS):
-                p_el = prim.find("c:p", NS)
-                vcount_el = prim.find("c:vcount", NS)
-                if p_el is not None and vcount_el is not None:
-                    indices = list(map(int, p_el.text.split()))
-                    vcounts = list(map(int, vcount_el.text.split()))
-                    inputs = prim.findall("c:input", NS)
-                    stride = len(inputs)
-                    # fan triangulate
-                    tri_list = []
-                    idx = 0
-                    for vc in vcounts:
-                        poly = [indices[idx + i * stride] for i in range(vc)]
-                        for i in range(1, vc - 1):
-                            tri_list.append([poly[0], poly[i], poly[i + 1]])
-                        idx += vc * stride
-                    faces = np.array(tri_list)
-
-        return pos_source, np.array(faces) if len(faces) > 0 else np.empty((0, 3), dtype=int)
+        return np.array(faces, dtype=np.int32) if faces else np.empty((0, 3), dtype=np.int32)
 
     def _parse_nodes(self):
         nodes = []
         for node in self.root.findall(".//c:node", NS):
-            name = node.get("name", "unnamed")
-            layer = node.get("layer", "default")
+            node_name = node.get("name", node.get("id", "unknown"))
 
-            # Get transform matrix
+            # SketchUp writes layer name in multiple possible attributes
+            layer_raw = (
+                node.get("layer") or
+                node.get("name", "").split(":")[0] or
+                "0"
+            )
+
+            # Also check for <extra><technique><layer> pattern (SketchUp 2020+)
+            extra = node.find(".//c:extra//c:technique//c:layer", NS)
+            if extra is not None and extra.text:
+                layer_raw = extra.text.strip()
+
             matrix_el = node.find("c:matrix", NS)
             transform = np.eye(4)
             if matrix_el is not None and matrix_el.text:
-                vals = list(map(float, matrix_el.text.split()))
-                transform = np.array(vals).reshape(4, 4)
+                vals = list(map(float, matrix_el.text.strip().split()))
+                if len(vals) == 16:
+                    transform = np.array(vals).reshape(4, 4)
 
-            # Find geometry reference
-            for inst in node.findall("c:instance_geometry", NS):
-                url = inst.get("url", "").lstrip("#")
-                nodes.append((name, url, layer, transform))
+            instance_geom = node.find(".//c:instance_geometry", NS)
+            if instance_geom is not None:
+                geo_url = instance_geom.get("url", "").lstrip("#")
+                nodes.append((node_name, geo_url, layer_raw, transform))
 
         return nodes
 
-    def _apply_transform(self, vertices: np.ndarray, matrix: np.ndarray) -> np.ndarray:
-        n = len(vertices)
-        ones = np.ones((n, 1))
-        homogeneous = np.hstack([vertices, ones])   # (N, 4)
-        transformed = (matrix @ homogeneous.T).T     # (N, 4)
+    def _apply_transform(self, vertices: np.ndarray, transform: np.ndarray) -> np.ndarray:
+        ones = np.ones((len(vertices), 1))
+        homogeneous = np.hstack([vertices, ones])
+        transformed = (transform @ homogeneous.T).T
         return transformed[:, :3]
